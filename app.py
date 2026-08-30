@@ -57,6 +57,12 @@ _state = {
     },
 }
 
+# The hardened Gunicorn collector is a separate module, but it must operate on
+# this exact Flask application's state. Expose the state explicitly rather than
+# making hardening.py guess or duplicate it.
+app._state = _state
+app._state_lock = _state_lock
+
 _session = {"master": None, "master_loaded_at": None}
 
 
@@ -307,6 +313,7 @@ def live_json():
 @app.get("/live.txt")
 def live_txt():
     payload = snapshot_state()
+    payload["generated_at"] = now_ist().isoformat()
     lines = ["SERVICE=UNPSYCHIC29_LIVE","SOURCE=DHAN","TIMEZONE=Asia/Kolkata",f"SESSION_DATE={payload['state']['session_date'] or ''}",f"MARKET_STATUS={market_status(now_ist())}",f"GENERATED_AT={payload['generated_at']}","SESSION=09:15-15:30","INTERVAL=1m","STORAGE=MEMORY_ONLY","PERSISTENT_STORAGE=false","SYNTHETIC_CANDLES=false","SYNTHETIC_VOLUME=false",f"COLLECTOR_ALIVE={payload['state']['collector_alive']}",f"LAST_SUCCESSFUL_CYCLE={payload['state']['last_successful_cycle_at'] or ''}",f"CYCLE_COUNT={payload['state']['cycle_count']}","","FORMAT=STOCK|TIME|OPEN|HIGH|LOW|CLOSE|VOLUME|SOURCE"]
     for symbol in STOCKS:
         stock = payload["stocks"][symbol]
