@@ -14,9 +14,6 @@ DHAN_INTRADAY_URL = "https://api.dhan.co/v2/charts/intraday"
 DHAN_SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 
 STOCKS = ["KEI", "POLYMED", "NATIONALUM", "TRAVELFOOD"]
-
-# These are the V5 decision candles. The acquisition layer does not calculate
-# V5 indicators; it only supplies the complete 1-minute OHLCV sequence.
 DECISION_CANDLES = {
     "KEI": "09:29",
     "POLYMED": "09:28",
@@ -24,16 +21,13 @@ DECISION_CANDLES = {
     "TRAVELFOOD": "09:50",
 }
 
-_session = {
-    "master": None,
-    "master_loaded_at": None,
-}
+_session = {"master": None, "master_loaded_at": None}
 
 
 def first_env(*names):
     for name in names:
         value = os.getenv(name)
-        if value:
+        if value and value.strip():
             return value.strip()
     return ""
 
@@ -95,10 +89,10 @@ def fetch_stock(symbol, security_id, now):
     session_start, session_end = market_window(now)
     effective_end = min(now, session_end)
 
-    # Dhan's intraday endpoint returns OHLC, volume and epoch timestamps.
-    # We request the current session and then filter strictly to 09:15-15:15 IST.
+    # Request the current trading day from Dhan. The endpoint supplies 1-minute
+    # OHLCV candles. We then strictly keep the 09:15-15:15 IST session.
     from_date = session_start.strftime("%Y-%m-%d %H:%M:%S")
-    to_date = (session_end.date() + timedelta(days=1)).strftime("%Y-%m-%d 00:00:00")
+    to_date = effective_end.strftime("%Y-%m-%d %H:%M:%S")
 
     headers = {
         "Accept": "application/json",
@@ -140,9 +134,8 @@ def fetch_stock(symbol, security_id, now):
             "high": highs[i],
             "low": lows[i],
             "close": closes[i],
+            "volume": volumes[i] if i < len(volumes) else 0,
         }
-        if i < len(volumes):
-            candle["volume"] = volumes[i]
         candles.append(candle)
 
     candles.sort(key=lambda x: x["timestamp"])
@@ -154,10 +147,13 @@ def build_payload():
     session_start, session_end = market_window(now)
     token = dhan_token()
 
-    status = "WEEKEND" if now.weekday() >= 5 else "PREMARKET"
-    if now.weekday() < 5 and session_start <= now <= session_end:
+    if now.weekday() >= 5:
+        status = "WEEKEND"
+    elif now < session_start:
+        status = "PREMARKET"
+    elif now <= session_end:
         status = "OPEN"
-    elif now.weekday() < 5 and now > session_end:
+    else:
         status = "CLOSED"
 
     result = {
@@ -167,11 +163,7 @@ def build_payload():
         "session_date": now.strftime("%Y-%m-%d"),
         "market_status": status,
         "generated_at": now.isoformat(),
-        "session": {
-            "start": "09:15",
-            "end": "15:15",
-            "interval": "1m",
-        },
+        "session": {"start": "09:15", "end": "15:15", "interval": "1m"},
         "stocks": {},
     }
 
@@ -188,7 +180,6 @@ def build_payload():
         return result
 
     result["status"] = "OK"
-
     for symbol in STOCKS:
         try:
             candles = fetch_stock(symbol, master[symbol], now)
@@ -206,8 +197,44 @@ def build_payload():
                 "data": [],
                 "error": str(exc),
             }
-
     return result
+
+
+def plain_text(payload):
+    lines = [
+        f"SERVICE=UNPSYCHIC29_LIVE",
+        f"SOURCE=DHAN",
+        f"TIMEZONE=Asia/Kolkata",
+        f"SESSION_DATE={payload.get('session_date', '')}",
+        f"MARKET_STATUS={payload.get('market_status', '')}",
+        f"GENERATED_AT={payload.get('generated_at', '')}",
+        "SESSION=09:15-15:15",
+        "INTERVAL=1m",
+        f"STATUS={payload.get('status', '')}",
+        "",
+    ]
+
+    if payload.get("error"):
+        lines.append(f"ERROR={payload['error']}")
+        lines.append("")
+
+    lines.append("FORMAT=STOCK|DECISION_CANDLE|TIME|OPEN|HIGH|LOW|CLOSE|VOLUME")
+
+    for symbol in STOCKS:
+        stock = payload.get("stocks", {}).get(symbol, {})
+        lines.append("")
+        lines.append(f"STOCK={symbol}")
+        lines.append(f"DECISION_CANDLE={stock.get('decision_candle', '')}")
+        lines.append(f"CANDLE_COUNT={stock.get('candle_count', 0)}")
+        if stock.get("error"):
+            lines.append(f"ERROR={stock['error']}")
+        for candle in stock.get("data", []):
+            lines.append(
+                f"{symbol}|{stock.get('decision_candle', '')}|{candle['timestamp']}|"
+                f"{candle['open']}|{candle['high']}|{candle['low']}|{candle['close']}|{candle['volume']}"
+            )
+
+    return "\n".join(lines) + "\n"
 
 
 @app.get("/")
@@ -215,7 +242,8 @@ def root():
     return jsonify({
         "service": "UNPSYCHIC29_LIVE",
         "status": "running",
-        "endpoint": "/live.json",
+        "json_endpoint": "/live.json",
+        "plain_text_endpoint": "/live.txt",
         "stocks": STOCKS,
         "market_window": "09:15-15:15 IST",
     })
@@ -230,6 +258,15 @@ def health():
 def live_json():
     payload = build_payload()
     response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+@app.get("/live.txt")
+def live_txt():
+    payload = build_payload()
+    response = Response(plain_text(payload), mimetype="text/plain")
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return response
