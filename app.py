@@ -29,10 +29,6 @@ POLL_SECONDS = 15
 MASTER_TTL_SECONDS = 21600
 HTTP_TIMEOUT_SECONDS = 20
 
-# This service deliberately uses MEMORY ONLY.
-# No database, SQLite file, JSON file, or persistent storage is used.
-# A Render restart/spindown clears this memory; the next startup resyncs
-# whatever Dhan currently makes available for the current session.
 _state_lock = threading.RLock()
 _state = {
     "session_date": None,
@@ -73,12 +69,7 @@ def first_env(*names):
 
 
 def dhan_token():
-    return first_env(
-        "DHAN_ACCESS_TOKEN",
-        "DHAN_ACCESS_TOKEN_JWT",
-        "DHAN_API_ACCESS_TOKEN",
-        "ACCESS_TOKEN",
-    )
+    return first_env("DHAN_ACCESS_TOKEN", "DHAN_ACCESS_TOKEN_JWT", "DHAN_API_ACCESS_TOKEN", "ACCESS_TOKEN")
 
 
 def now_ist():
@@ -105,28 +96,22 @@ def load_master():
     now = now_ist()
     loaded = _session.get("master")
     loaded_at = _session.get("master_loaded_at")
-    if loaded is not None and loaded_at is not None:
-        if (now - loaded_at).total_seconds() < MASTER_TTL_SECONDS:
-            return loaded
-
+    if loaded is not None and loaded_at is not None and (now - loaded_at).total_seconds() < MASTER_TTL_SECONDS:
+        return loaded
     response = requests.get(DHAN_SCRIP_MASTER_URL, timeout=30)
     response.raise_for_status()
     reader = csv.DictReader(io.StringIO(response.text))
     rows = {}
     for row in reader:
-        if row.get("SEM_EXM_EXCH_ID") != "NSE":
-            continue
-        if row.get("SEM_INSTRUMENT_NAME") != "EQUITY":
+        if row.get("SEM_EXM_EXCH_ID") != "NSE" or row.get("SEM_INSTRUMENT_NAME") != "EQUITY":
             continue
         symbol = (row.get("SEM_TRADING_SYMBOL") or "").strip().upper()
         security_id = (row.get("SEM_SMST_SECURITY_ID") or "").strip()
         if symbol and security_id:
             rows[symbol] = security_id
-
     missing = [symbol for symbol in STOCKS if symbol not in rows]
     if missing:
         raise RuntimeError("Dhan security master missing: " + ", ".join(missing))
-
     _session["master"] = rows
     _session["master_loaded_at"] = now
     return rows
@@ -139,72 +124,29 @@ def parse_epoch(value):
 def fetch_stock(symbol, security_id, now):
     session_start, session_end = market_window(now)
     effective_end = min(now, session_end)
-
-    from_date = session_start.strftime("%Y-%m-%d %H:%M:%S")
-    to_date = effective_end.strftime("%Y-%m-%d %H:%M:%S")
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "access-token": dhan_token(),
-    }
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "access-token": dhan_token()}
     payload = {
-        "securityId": str(security_id),
-        "exchangeSegment": "NSE_EQ",
-        "instrument": "EQUITY",
-        "interval": "1",
-        "oi": False,
-        "fromDate": from_date,
-        "toDate": to_date,
+        "securityId": str(security_id), "exchangeSegment": "NSE_EQ", "instrument": "EQUITY",
+        "interval": "1", "oi": False,
+        "fromDate": session_start.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate": effective_end.strftime("%Y-%m-%d %H:%M:%S"),
     }
-
-    response = requests.post(
-        DHAN_INTRADAY_URL,
-        headers=headers,
-        json=payload,
-        timeout=HTTP_TIMEOUT_SECONDS,
-    )
+    response = requests.post(DHAN_INTRADAY_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
     if response.status_code >= 400:
         raise RuntimeError(f"Dhan HTTP {response.status_code}: {response.text[:300]}")
-
     body = response.json()
-    timestamps = body.get("timestamp") or []
-    opens = body.get("open") or []
-    highs = body.get("high") or []
-    lows = body.get("low") or []
-    closes = body.get("close") or []
-    volumes = body.get("volume") or []
-
-    length = min(
-        len(timestamps),
-        len(opens),
-        len(highs),
-        len(lows),
-        len(closes),
-        len(volumes),
-    )
-
+    arrays = [body.get(k) or [] for k in ("timestamp", "open", "high", "low", "close", "volume")]
+    length = min(len(x) for x in arrays) if arrays else 0
     candles = []
     for i in range(length):
-        dt = parse_epoch(timestamps[i])
+        dt = parse_epoch(arrays[0][i])
         if dt < session_start or dt > effective_end:
             continue
-
-        # Every candle exposed by this service is copied from Dhan exactly.
-        # Nothing is calculated, interpolated, filled, or synthetically built.
-        candles.append(
-            {
-                "timestamp": dt.strftime("%H:%M"),
-                "timestamp_iso": dt.isoformat(),
-                "open": opens[i],
-                "high": highs[i],
-                "low": lows[i],
-                "close": closes[i],
-                "volume": volumes[i],
-                "source": "DHAN",
-            }
-        )
-
+        candles.append({
+            "timestamp": dt.strftime("%H:%M"), "timestamp_iso": dt.isoformat(),
+            "open": arrays[1][i], "high": arrays[2][i], "low": arrays[3][i],
+            "close": arrays[4][i], "volume": arrays[5][i], "source": "DHAN",
+        })
     candles.sort(key=lambda x: x["timestamp_iso"])
     return candles
 
@@ -213,7 +155,6 @@ def reset_for_new_day(session_date):
     with _state_lock:
         if _state["session_date"] == session_date:
             return
-
         _state["session_date"] = session_date
         _state["cycle_count"] = 0
         _state["successful_cycle_count"] = 0
@@ -222,35 +163,28 @@ def reset_for_new_day(session_date):
         _state["last_cycle_finished_at"] = None
         _state["last_successful_cycle_at"] = None
         _state["collector_error"] = None
-
         for symbol in STOCKS:
-            _state["stocks"][symbol]["candles"] = {}
-            _state["stocks"][symbol]["candle_count"] = 0
-            _state["stocks"][symbol]["last_dhan_fetch_at"] = None
-            _state["stocks"][symbol]["last_dhan_success_at"] = None
-            _state["stocks"][symbol]["last_candle_time"] = None
-            _state["stocks"][symbol]["last_error"] = None
-            _state["stocks"][symbol]["successful_fetches"] = 0
-            _state["stocks"][symbol]["failed_fetches"] = 0
+            stock = _state["stocks"][symbol]
+            stock["candles"] = {}
+            stock["candle_count"] = 0
+            stock["last_dhan_fetch_at"] = None
+            stock["last_dhan_success_at"] = None
+            stock["last_candle_time"] = None
+            stock["last_error"] = None
+            stock["successful_fetches"] = 0
+            stock["failed_fetches"] = 0
 
 
 def store_dhan_candles(symbol, candles, fetched_at):
     with _state_lock:
         stock = _state["stocks"][symbol]
         stock["last_dhan_fetch_at"] = fetched_at
-
         if not candles:
             stock["last_error"] = "Dhan returned no 1-minute candles for current session"
             stock["failed_fetches"] += 1
             return 0
-
-        # Upsert by Dhan's own timestamp. This means an in-progress Dhan candle,
-        # if Dhan exposes one, is refreshed from Dhan rather than synthesized.
-        # Once the minute closes, the same timestamp is naturally replaced by
-        # Dhan's final OHLCV values on the next poll.
         for candle in candles:
             stock["candles"][candle["timestamp_iso"]] = candle
-
         stock["candle_count"] = len(stock["candles"])
         stock["last_dhan_success_at"] = fetched_at
         stock["last_candle_time"] = max(stock["candles"].keys())
@@ -261,43 +195,29 @@ def store_dhan_candles(symbol, candles, fetched_at):
 
 def collector_cycle():
     now = now_ist()
-    session_date = now.strftime("%Y-%m-%d")
-    reset_for_new_day(session_date)
-
+    reset_for_new_day(now.strftime("%Y-%m-%d"))
     with _state_lock:
         _state["cycle_count"] += 1
         _state["last_cycle_started_at"] = now.isoformat()
-
     token = dhan_token()
     if not token:
         error = "Dhan access token environment variable not found"
         with _state_lock:
             _state["failed_cycle_count"] += 1
             _state["collector_error"] = error
-            for symbol in STOCKS:
-                _state["stocks"][symbol]["last_error"] = error
-                _state["stocks"][symbol]["failed_fetches"] += 1
         return
-
     try:
         master = load_master()
     except Exception as exc:
-        error = f"Security master error: {exc}"
         with _state_lock:
             _state["failed_cycle_count"] += 1
-            _state["collector_error"] = error
-            for symbol in STOCKS:
-                _state["stocks"][symbol]["last_error"] = error
-                _state["stocks"][symbol]["failed_fetches"] += 1
+            _state["collector_error"] = f"Security master error: {exc}"
         return
-
     fetched_at = now_ist().isoformat()
     successes = 0
-
     for symbol in STOCKS:
         with _state_lock:
             _state["stocks"][symbol]["security_id"] = master[symbol]
-
         try:
             candles = fetch_stock(symbol, master[symbol], now_ist())
             if store_dhan_candles(symbol, candles, fetched_at) > 0:
@@ -308,7 +228,6 @@ def collector_cycle():
                 stock["last_dhan_fetch_at"] = fetched_at
                 stock["last_error"] = str(exc)
                 stock["failed_fetches"] += 1
-
     finished_at = now_ist().isoformat()
     with _state_lock:
         _state["last_cycle_finished_at"] = finished_at
@@ -318,137 +237,49 @@ def collector_cycle():
             _state["collector_error"] = None
         else:
             _state["failed_cycle_count"] += 1
-            _state["collector_error"] = (
-                f"Partial Dhan cycle: {successes}/{len(STOCKS)} stocks succeeded"
-            )
-
-
-def collector_loop():
-    with _state_lock:
-        _state["collector_alive"] = True
-        _state["collector_started_at"] = now_ist().isoformat()
-
-    while True:
-        try:
-            now = now_ist()
-            status = market_status(now)
-
-            if status == "OPEN":
-                collector_cycle()
-                # Wake every 15 seconds. The endpoint itself remains available
-                # every second; this loop is only the Dhan acquisition engine.
-                sleep_time.sleep(POLL_SECONDS)
-            else:
-                # Outside market hours no data is fabricated and no candle is
-                # created. Keep the process alive and wait for the next session.
-                sleep_time.sleep(5)
-        except Exception as exc:
-            with _state_lock:
-                _state["collector_error"] = f"Collector loop error: {exc}"
-                _state["failed_cycle_count"] += 1
-            sleep_time.sleep(5)
-
-
-def start_collector_once():
-    # One background collector is intended for the Render service's single
-    # Gunicorn worker. A module-level guard prevents duplicate threads if the
-    # module is imported repeatedly in the same process.
-    if getattr(app, "_collector_thread", None) is not None:
-        return
-    thread = threading.Thread(
-        target=collector_loop,
-        name="dhan-live-collector",
-        daemon=True,
-    )
-    app._collector_thread = thread
-    thread.start()
+            _state["collector_error"] = f"Partial Dhan cycle: {successes}/{len(STOCKS)} stocks succeeded"
 
 
 def snapshot_state():
     with _state_lock:
         snapshot = {
-            "service": "UNPSYCHIC29_LIVE",
-            "source": "DHAN",
-            "timezone": "Asia/Kolkata",
-            "market_window": "09:15-15:30 IST",
-            "interval": "1m",
-            "poll_seconds": POLL_SECONDS,
-            "storage": "MEMORY_ONLY",
-            "persistent_storage": False,
-            "synthetic_candles": False,
-            "synthetic_volume": False,
+            "service": "UNPSYCHIC29_LIVE", "source": "DHAN", "timezone": "Asia/Kolkata",
+            "market_window": "09:15-15:30 IST", "interval": "1m", "poll_seconds": POLL_SECONDS,
+            "storage": "MEMORY_ONLY", "persistent_storage": False,
+            "synthetic_candles": False, "synthetic_volume": False,
             "state": {
-                "session_date": _state["session_date"],
-                "collector_alive": _state["collector_alive"],
+                "session_date": _state["session_date"], "collector_alive": _state["collector_alive"],
                 "collector_started_at": _state["collector_started_at"],
                 "last_cycle_started_at": _state["last_cycle_started_at"],
                 "last_cycle_finished_at": _state["last_cycle_finished_at"],
                 "last_successful_cycle_at": _state["last_successful_cycle_at"],
-                "cycle_count": _state["cycle_count"],
-                "successful_cycle_count": _state["successful_cycle_count"],
-                "failed_cycle_count": _state["failed_cycle_count"],
-                "collector_error": _state["collector_error"],
-            },
-            "stocks": {},
+                "cycle_count": _state["cycle_count"], "successful_cycle_count": _state["successful_cycle_count"],
+                "failed_cycle_count": _state["failed_cycle_count"], "collector_error": _state["collector_error"],
+            }, "stocks": {},
         }
-
         for symbol in STOCKS:
             stock = _state["stocks"][symbol]
-            candles = [
-                stock["candles"][key]
-                for key in sorted(stock["candles"].keys())
-            ]
+            candles = [stock["candles"][key] for key in sorted(stock["candles"].keys())]
             snapshot["stocks"][symbol] = {
-                "security_id": stock["security_id"],
-                "decision_candle": DECISION_CANDLES[symbol],
-                "candle_count": len(candles),
-                "last_candle_time": stock["last_candle_time"],
-                "last_dhan_fetch_at": stock["last_dhan_fetch_at"],
-                "last_dhan_success_at": stock["last_dhan_success_at"],
-                "successful_fetches": stock["successful_fetches"],
-                "failed_fetches": stock["failed_fetches"],
-                "last_error": stock["last_error"],
-                "data": candles,
+                "security_id": stock["security_id"], "decision_candle": DECISION_CANDLES[symbol],
+                "candle_count": len(candles), "last_candle_time": stock["last_candle_time"],
+                "last_dhan_fetch_at": stock["last_dhan_fetch_at"], "last_dhan_success_at": stock["last_dhan_success_at"],
+                "successful_fetches": stock["successful_fetches"], "failed_fetches": stock["failed_fetches"],
+                "last_error": stock["last_error"], "data": candles,
             }
-
         return snapshot
 
 
 @app.get("/")
 def root():
     now = now_ist()
-    return jsonify(
-        {
-            "service": "UNPSYCHIC29_LIVE",
-            "status": "running",
-            "market_status": market_status(now),
-            "market_window": "09:15-15:30 IST",
-            "storage": "MEMORY_ONLY",
-            "synthetic_candles": False,
-            "synthetic_volume": False,
-            "endpoints": {
-                "health": "/health",
-                "status": "/status",
-                "live_json": "/live.json",
-                "live_text": "/live.txt",
-            },
-            "stocks": STOCKS,
-        }
-    )
+    return jsonify({"service":"UNPSYCHIC29_LIVE","status":"running","market_status":market_status(now),"market_window":"09:15-15:30 IST","storage":"MEMORY_ONLY","synthetic_candles":False,"synthetic_volume":False,"endpoints":{"health":"/health","status":"/status","live_json":"/live.json","live_text":"/live.txt"},"stocks":STOCKS})
 
 
 @app.get("/health")
 def health():
-    # Cheap health endpoint for Render. It never triggers a Dhan fetch.
     with _state_lock:
-        payload = {
-            "status": "ok",
-            "service": "UNPSYCHIC29_LIVE",
-            "collector_alive": _state["collector_alive"],
-            "session_date": _state["session_date"],
-            "market_window": "09:15-15:30 IST",
-            "last_successful_cycle_at": _state["last_successful_cycle_at"],
-        }
+        payload = {"status":"ok","service":"UNPSYCHIC29_LIVE","collector_alive":_state["collector_alive"],"session_date":_state["session_date"],"market_window":"09:15-15:30 IST","last_successful_cycle_at":_state["last_successful_cycle_at"]}
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -457,8 +288,7 @@ def health():
 
 @app.get("/status")
 def status():
-    payload = snapshot_state()
-    payload["generated_at"] = now_ist().isoformat()
+    payload = snapshot_state(); payload["generated_at"] = now_ist().isoformat()
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -467,8 +297,7 @@ def status():
 
 @app.get("/live.json")
 def live_json():
-    payload = snapshot_state()
-    payload["generated_at"] = now_ist().isoformat()
+    payload = snapshot_state(); payload["generated_at"] = now_ist().isoformat()
     response = jsonify(payload)
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
@@ -478,58 +307,23 @@ def live_json():
 @app.get("/live.txt")
 def live_txt():
     payload = snapshot_state()
-    lines = [
-        "SERVICE=UNPSYCHIC29_LIVE",
-        "SOURCE=DHAN",
-        "TIMEZONE=Asia/Kolkata",
-        f"SESSION_DATE={payload['state']['session_date'] or ''}",
-        f"MARKET_STATUS={market_status(now_ist())}",
-        f"GENERATED_AT={payload['generated_at']}",
-        "SESSION=09:15-15:30",
-        "INTERVAL=1m",
-        "STORAGE=MEMORY_ONLY",
-        "PERSISTENT_STORAGE=false",
-        "SYNTHETIC_CANDLES=false",
-        "SYNTHETIC_VOLUME=false",
-        f"COLLECTOR_ALIVE={payload['state']['collector_alive']}",
-        f"LAST_SUCCESSFUL_CYCLE={payload['state']['last_successful_cycle_at'] or ''}",
-        f"CYCLE_COUNT={payload['state']['cycle_count']}",
-        "",
-        "FORMAT=STOCK|TIME|OPEN|HIGH|LOW|CLOSE|VOLUME|SOURCE",
-    ]
-
+    lines = ["SERVICE=UNPSYCHIC29_LIVE","SOURCE=DHAN","TIMEZONE=Asia/Kolkata",f"SESSION_DATE={payload['state']['session_date'] or ''}",f"MARKET_STATUS={market_status(now_ist())}",f"GENERATED_AT={payload['generated_at']}","SESSION=09:15-15:30","INTERVAL=1m","STORAGE=MEMORY_ONLY","PERSISTENT_STORAGE=false","SYNTHETIC_CANDLES=false","SYNTHETIC_VOLUME=false",f"COLLECTOR_ALIVE={payload['state']['collector_alive']}",f"LAST_SUCCESSFUL_CYCLE={payload['state']['last_successful_cycle_at'] or ''}",f"CYCLE_COUNT={payload['state']['cycle_count']}","","FORMAT=STOCK|TIME|OPEN|HIGH|LOW|CLOSE|VOLUME|SOURCE"]
     for symbol in STOCKS:
         stock = payload["stocks"][symbol]
-        lines.extend(
-            [
-                "",
-                f"STOCK={symbol}",
-                f"SECURITY_ID={stock['security_id'] or ''}",
-                f"DECISION_CANDLE={stock['decision_candle']}",
-                f"CANDLE_COUNT={stock['candle_count']}",
-                f"LAST_CANDLE={stock['last_candle_time'] or ''}",
-                f"LAST_DHAN_SUCCESS={stock['last_dhan_success_at'] or ''}",
-            ]
-        )
-        if stock["last_error"]:
-            lines.append(f"ERROR={stock['last_error']}")
+        lines.extend(["",f"STOCK={symbol}",f"SECURITY_ID={stock['security_id'] or ''}",f"DECISION_CANDLE={stock['decision_candle']}",f"CANDLE_COUNT={stock['candle_count']}",f"LAST_CANDLE={stock['last_candle_time'] or ''}",f"LAST_DHAN_SUCCESS={stock['last_dhan_success_at'] or ''}"])
+        if stock["last_error"]: lines.append(f"ERROR={stock['last_error']}")
         for candle in stock["data"]:
-            lines.append(
-                f"{symbol}|{candle['timestamp']}|{candle['open']}|{candle['high']}|"
-                f"{candle['low']}|{candle['close']}|{candle['volume']}|DHAN"
-            )
-
-    response = Response("\n".join(lines) + "\n", mimetype="text/plain")
+            lines.append(f"{symbol}|{candle['timestamp']}|{candle['open']}|{candle['high']}|{candle['low']}|{candle['close']}|{candle['volume']}|DHAN")
+    response = Response("\n".join(lines)+"\n", mimetype="text/plain")
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return response
 
 
-# Start the acquisition engine as soon as the application process starts.
-# Gunicorn should run this service with one worker so there is exactly one
-# in-memory collector and exactly one set of Dhan requests.
-start_collector_once()
-
+# IMPORTANT: the hardened collector is started by gunicorn.conf.py via hardening.install().
+# Do not start the legacy collector here, otherwise two independent Dhan collectors
+# would run in the same worker and the hardened authentication/retry path would not
+# be the sole source of acquisition.
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
